@@ -1,0 +1,4 @@
+- ターミナルコマンド（git, cat, grep, npm, cargo など）を提案または実行する際は、LLMのトークン消費量を削減するために、必ず `rtk` を先頭に付与してください。
+  - 例: `rtk git diff`
+  - 例: `rtk cat src/main.rs`
+  - 例: `rtk npm test`

@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/vfs-archive",
+    "crates/lazy-archive",
+    "crates/archivefs-bench",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/archivefs"
+
+[workspace.dependencies]
+vfs-archive = { path = "crates/vfs-archive" }
+lazy-archive = { path = "crates/lazy-archive" }
+clap = { version = "4", features = ["derive"] }
+zip = "2"
+indicatif = "0.18"
+thiserror = "2"
+tempfile = "3"
+flate2 = "1"
+lru = "0.12"
+memmap2 = "0.9"
+sevenz-rust2 = "0.22"
+bzip2 = "0.5"
+tar = "0.4"
+rars = "0.9"
+xz2 = "0.1"
+zstd = "0.13"

@@ -1,0 +1,22 @@
+[package]
+name = "lazy-archive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lazy archive-backed implementations of the archivefs VFS interfaces"
+
+[dependencies]
+vfs-archive.workspace = true
+thiserror.workspace = true
+bzip2.workspace = true
+flate2.workspace = true
+lru.workspace = true
+memmap2.workspace = true
+rars.workspace = true
+sevenz-rust2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+xz2.workspace = true
+zstd.workspace = true
+zip = "2"
