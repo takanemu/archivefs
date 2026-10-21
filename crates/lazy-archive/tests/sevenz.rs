@@ -77,9 +77,13 @@ fn reuses_cached_sevenz_entry() {
         .to_owned();
 
     vfs.open(&path).expect("open 7z entry first time");
-    assert_eq!(vfs.cache_len().expect("read cache length"), 1);
+    assert_eq!(
+        vfs.cache_len().expect("read cache length"),
+        2,
+        "materializing one entry must cache every entry in its solid block"
+    );
     vfs.open(&path).expect("open 7z entry second time");
-    assert_eq!(vfs.cache_len().expect("read cache length"), 1);
+    assert_eq!(vfs.cache_len().expect("read cache length"), 2);
 }
 
 #[test]

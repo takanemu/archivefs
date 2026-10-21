@@ -86,7 +86,9 @@ TAR系の署名が判定できない場合は拡張子が使われます。対�
 
 ## キャッシュの設定
 
-TAR系、7z、RARでは、読み込み対象のエントリをオンデマンドで展開し、`EntryCache`に保持します。既定値は最大256エントリ、メモリ保持閾値1 MiB、総キャッシュサイズ64 MiBです。閾値を超えるエントリは一時ファイルに保存されます。キャッシュ破棄時には一時ファイルも削除されます。
+TAR系とRARでは、読み込み対象のエントリをオンデマンドで展開し、`EntryCache`に保持します。既定値は最大256エントリ、メモリ保持閾値1 MiB、総キャッシュサイズ64 MiBです。
+
+7zでは、solidブロック内のエントリを個別に繰り返し展開しないよう、最初のアクセス時に対象ブロック全体を一度展開し、エントリごとの範囲を記録してブロック単位でLRUキャッシュします。既定のブロックキャッシュ上限は256ブロックまたは256 MiBで、1 MiBを超える展開データは一時ファイルへ保存します。これは初回アクセス時にブロック全体を展開する代わりに、同じブロックへの後続アクセスを速くする方式です。キャッシュ追い出しや破棄で一時ファイルは削除されます。すでに開いているreaderは、読み込み終了までそのストレージを保持します。
 
 ZIPエントリはアーカイブから直接読み込むため、`EntryCache`には格納されません。
 
@@ -108,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`EntryCache::with_limits(capacity, memory_threshold, max_bytes)`の各値はバイト単位です。最大エントリ数または総サイズを超えるとLRU順で追い出されます。単一エントリが`max_bytes`を超える場合、そのエントリはキャッシュされません。`EntryCache::new`と`EntryCache::with_memory_threshold`を使うと、一部の上限だけを指定できます。
+`EntryCache::with_limits(capacity, memory_threshold, max_bytes)`では、`memory_threshold`と`max_bytes`はバイト単位です。7zでは`capacity`がキャッシュするブロック数の上限、`max_bytes`が展開ブロックの合計サイズ上限として使われます。指定した上限を超えるブロックはそのアクセス中だけ保持し、LRUには登録しません。TAR系とRARでは、従来どおり`capacity`はエントリ数、`max_bytes`はエントリキャッシュの合計サイズです。`EntryCache::default`の7zブロックキャッシュ上限は256 MiBです。`EntryCache::new`と`EntryCache::with_memory_threshold`を使う場合、7zブロックの合計上限は`max_bytes`と同じ値になります。
 
 ## エラーの扱い
 

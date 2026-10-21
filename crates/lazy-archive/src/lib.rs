@@ -2,11 +2,13 @@
 //!
 //! Format-specific readers and lazy archive access.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 
 use bzip2::read::BzDecoder;
@@ -143,6 +145,7 @@ pub fn open_archive_with_cache(
 const DEFAULT_MEMORY_THRESHOLD: usize = 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_CACHE_CAPACITY: usize = 256;
+const DEFAULT_MAX_BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 enum CachedEntry {
     Memory(Vec<u8>),
@@ -484,10 +487,225 @@ impl CachedEntry {
     }
 }
 
+enum BlockStorage {
+    Memory(Vec<u8>),
+    Temporary {
+        _file: tempfile::NamedTempFile,
+        map: Mmap,
+    },
+}
+
+impl BlockStorage {
+    fn from_entry(entry: CachedEntry) -> io::Result<Self> {
+        match entry {
+            CachedEntry::Memory(contents) => Ok(Self::Memory(contents)),
+            CachedEntry::Temporary(file) => {
+                if file.as_file().metadata()?.len() == 0 {
+                    return Ok(Self::Memory(Vec::new()));
+                }
+                let map = unsafe { Mmap::map(file.as_file())? };
+                Ok(Self::Temporary { _file: file, map })
+            }
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Memory(contents) => contents,
+            Self::Temporary { map, .. } => map,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+}
+
+struct DecodedBlock {
+    storage: BlockStorage,
+    ranges: HashMap<PathBuf, Range<usize>>,
+}
+
+impl DecodedBlock {
+    fn reader(self: &Arc<Self>, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
+        let range = self.ranges.get(path).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "decoded 7z block does not contain entry: {}",
+                    path.display()
+                ),
+            )
+        })?;
+        Ok(Box::new(BlockRangeReader {
+            block: Arc::clone(self),
+            range,
+            position: 0,
+        }))
+    }
+}
+
+struct BlockRangeReader {
+    block: Arc<DecodedBlock>,
+    range: Range<usize>,
+    position: usize,
+}
+
+impl Read for BlockRangeReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.position >= self.range.len() {
+            return Ok(0);
+        }
+
+        let read_length = (self.range.len() - self.position).min(buffer.len());
+        let start = self
+            .range
+            .start
+            .checked_add(self.position)
+            .ok_or_else(|| io::Error::other("7z block range overflowed"))?;
+        let end = start
+            .checked_add(read_length)
+            .ok_or_else(|| io::Error::other("7z block read range overflowed"))?;
+        buffer[..read_length].copy_from_slice(&self.block.storage.bytes()[start..end]);
+        self.position += read_length;
+        Ok(read_length)
+    }
+}
+
+impl Seek for BlockRangeReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let current = i128::try_from(self.position).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "reader position overflowed")
+        })?;
+        let length = i128::try_from(self.range.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "entry length overflowed"))?;
+        let next = match position {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::Current(offset) => current + i128::from(offset),
+            SeekFrom::End(offset) => length + i128::from(offset),
+        };
+        if next < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "7z block range seek moved before the beginning",
+            ));
+        }
+        self.position = usize::try_from(next).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "7z block range seek overflowed",
+            )
+        })?;
+        u64::try_from(self.position)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seek position overflowed"))
+    }
+}
+
+struct BlockCacheState {
+    blocks: LruCache<usize, Arc<DecodedBlock>>,
+    current_bytes: usize,
+}
+
+struct BlockCache {
+    state: Mutex<BlockCacheState>,
+    loading: Mutex<HashMap<usize, Weak<Mutex<()>>>>,
+    capacity: NonZeroUsize,
+    max_bytes: usize,
+}
+
+impl BlockCache {
+    fn new(capacity: NonZeroUsize, max_bytes: usize) -> Self {
+        Self {
+            state: Mutex::new(BlockCacheState {
+                blocks: LruCache::new(capacity),
+                current_bytes: 0,
+            }),
+            loading: Mutex::new(HashMap::new()),
+            capacity,
+            max_bytes,
+        }
+    }
+
+    fn get_or_load(
+        &self,
+        block_index: usize,
+        load: impl FnOnce() -> io::Result<DecodedBlock>,
+    ) -> io::Result<Arc<DecodedBlock>> {
+        if let Some(block) = self.get(block_index)? {
+            return Ok(block);
+        }
+
+        let block_lock = {
+            let mut loading = self
+                .loading
+                .lock()
+                .map_err(|_| io::Error::other("7z block load map was poisoned"))?;
+            loading.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = loading.get(&block_index).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                loading.insert(block_index, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _load_guard = block_lock
+            .lock()
+            .map_err(|_| io::Error::other("7z block load lock was poisoned"))?;
+
+        if let Some(block) = self.get(block_index)? {
+            return Ok(block);
+        }
+
+        let block = Arc::new(load()?);
+        let block_bytes = block.storage.len();
+        if block_bytes <= self.max_bytes {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("7z block cache was poisoned"))?;
+            while state.blocks.len() >= self.capacity.get()
+                || state.current_bytes.saturating_add(block_bytes) > self.max_bytes
+            {
+                let Some((_, evicted)) = state.blocks.pop_lru() else {
+                    break;
+                };
+                state.current_bytes = state.current_bytes.saturating_sub(evicted.storage.len());
+            }
+            if state.current_bytes.saturating_add(block_bytes) <= self.max_bytes {
+                state.current_bytes = state.current_bytes.saturating_add(block_bytes);
+                state.blocks.put(block_index, Arc::clone(&block));
+            }
+        }
+        Ok(block)
+    }
+
+    fn get(&self, block_index: usize) -> io::Result<Option<Arc<DecodedBlock>>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("7z block cache was poisoned"))?;
+        Ok(state.blocks.get(&block_index).cloned())
+    }
+
+    fn cached_entry_count(&self) -> io::Result<usize> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("7z block cache was poisoned"))?;
+        Ok(state
+            .blocks
+            .iter()
+            .map(|(_, block)| block.ranges.len())
+            .sum())
+    }
+}
+
 struct Materializer {
     memory_threshold: usize,
     memory: Vec<u8>,
     temporary: Option<tempfile::NamedTempFile>,
+    bytes_written: usize,
 }
 
 struct SharedMaterializerWriter {
@@ -516,7 +734,12 @@ impl Materializer {
             memory_threshold,
             memory: Vec::new(),
             temporary: None,
+            bytes_written: 0,
         }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes_written
     }
 
     fn finish(self) -> io::Result<CachedEntry> {
@@ -531,6 +754,10 @@ impl Materializer {
 
 impl Write for Materializer {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let new_len = self
+            .bytes_written
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("materialized archive data length overflowed"))?;
         if self.temporary.is_none()
             && self.memory.len().saturating_add(buffer.len()) > self.memory_threshold
         {
@@ -545,6 +772,7 @@ impl Write for Materializer {
         } else {
             self.memory.extend_from_slice(buffer);
         }
+        self.bytes_written = new_len;
         Ok(buffer.len())
     }
 
@@ -562,6 +790,7 @@ pub struct EntryCache {
     capacity: NonZeroUsize,
     memory_threshold: usize,
     max_bytes: usize,
+    max_block_bytes: usize,
     current_bytes: Mutex<usize>,
 }
 
@@ -575,11 +804,21 @@ impl EntryCache {
     }
 
     pub fn with_limits(capacity: NonZeroUsize, memory_threshold: usize, max_bytes: usize) -> Self {
+        Self::with_cache_limits(capacity, memory_threshold, max_bytes, max_bytes)
+    }
+
+    fn with_cache_limits(
+        capacity: NonZeroUsize,
+        memory_threshold: usize,
+        max_bytes: usize,
+        max_block_bytes: usize,
+    ) -> Self {
         Self {
             entries: Mutex::new(LruCache::new(capacity)),
             capacity,
             memory_threshold,
             max_bytes,
+            max_block_bytes,
             current_bytes: Mutex::new(0),
         }
     }
@@ -667,8 +906,11 @@ impl EntryCache {
 
 impl Default for EntryCache {
     fn default() -> Self {
-        Self::new(
+        Self::with_cache_limits(
             NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).expect("default cache capacity is non-zero"),
+            DEFAULT_MEMORY_THRESHOLD,
+            DEFAULT_MAX_CACHE_BYTES,
+            DEFAULT_MAX_BLOCK_CACHE_BYTES,
         )
     }
 }
@@ -971,10 +1213,20 @@ fn tar_open<R: Read>(reader: R, path: &Path, cache: &EntryCache) -> io::Result<B
     cache.insert_reader(path.to_owned(), &mut entry)
 }
 
-/// A 7z archive with lazy solid-block extraction and entry caching.
+#[derive(Clone, Copy)]
+struct SevenZEntryLocation {
+    file_index: usize,
+    block_index: Option<usize>,
+    is_directory: bool,
+}
+
+/// A 7z archive with lazy solid-block extraction and block caching.
 pub struct SevenZArchiveVfs {
     path: PathBuf,
-    cache: EntryCache,
+    archive: sevenz_rust2::Archive,
+    entries: HashMap<PathBuf, SevenZEntryLocation>,
+    cache: BlockCache,
+    memory_threshold: usize,
 }
 
 impl SevenZArchiveVfs {
@@ -984,19 +1236,114 @@ impl SevenZArchiveVfs {
 
     pub fn with_cache(path: impl Into<PathBuf>, cache: EntryCache) -> Result<Self> {
         let path = path.into();
-        sevenz_rust2::Archive::open(&path).map_err(sevenz_error)?;
-        Ok(Self { path, cache })
+        let archive = sevenz_rust2::Archive::open(&path).map_err(sevenz_error)?;
+        let mut entries = HashMap::with_capacity(archive.files.len());
+        for (file_index, entry) in archive.files.iter().enumerate() {
+            let path = PathBuf::from(entry.name());
+            let block_index = archive
+                .stream_map
+                .file_block_index
+                .get(file_index)
+                .copied()
+                .flatten();
+            entries.entry(path).or_insert(SevenZEntryLocation {
+                file_index,
+                block_index,
+                is_directory: entry.is_directory(),
+            });
+        }
+
+        Ok(Self {
+            path,
+            archive,
+            entries,
+            cache: BlockCache::new(cache.capacity, cache.max_block_bytes),
+            memory_threshold: cache.memory_threshold,
+        })
     }
 
+    /// Returns the number of entries represented by cached decoded blocks.
     pub fn cache_len(&self) -> io::Result<usize> {
-        self.cache.len()
+        self.cache.cached_entry_count()
+    }
+
+    fn materialize_block(&self, block_index: usize) -> io::Result<DecodedBlock> {
+        let mut source = File::open(&self.path)?;
+        let thread_count =
+            thread::available_parallelism().map_or(1, |count| count.get().min(256) as u32);
+        let password = sevenz_rust2::Password::empty();
+        let decoder = sevenz_rust2::BlockDecoder::new(
+            thread_count,
+            block_index,
+            &self.archive,
+            &password,
+            &mut source,
+        );
+        let first_file_index = *self
+            .archive
+            .stream_map
+            .block_first_file_index
+            .get(block_index)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "7z block index is invalid")
+            })?;
+        let file_count = decoder.entry_count();
+        let block_end = first_file_index.checked_add(file_count).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "7z block file range overflowed")
+        })?;
+        let mut file_index = first_file_index;
+        let mut too_many_entries = false;
+        let mut materializer = Materializer::new(self.memory_threshold);
+        let mut ranges = HashMap::with_capacity(file_count);
+
+        decoder
+            .for_each_entries(&mut |entry, reader| {
+                if file_index >= block_end {
+                    too_many_entries = true;
+                    return Ok(false);
+                }
+                let start = materializer.len();
+                io::copy(reader, &mut materializer)?;
+                let end = materializer.len();
+                let actual_size = u64::try_from(end - start).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "7z entry size overflowed")
+                })?;
+                if actual_size != entry.size() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("decoded size mismatch for 7z entry: {}", entry.name()),
+                    )
+                    .into());
+                }
+                let path = PathBuf::from(entry.name());
+                if self.entries.get(&path).is_some_and(|location| {
+                    location.file_index == file_index && location.block_index == Some(block_index)
+                }) {
+                    ranges.insert(path, start..end);
+                }
+                file_index += 1;
+                Ok(true)
+            })
+            .map_err(sevenz_error)?;
+
+        if too_many_entries || file_index != block_end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "7z block returned fewer entries than declared",
+            ));
+        }
+
+        Ok(DecodedBlock {
+            storage: BlockStorage::from_entry(materializer.finish()?)?,
+            ranges,
+        })
     }
 }
 
 impl ArchiveVfs for SevenZArchiveVfs {
     fn entries(&self) -> io::Result<Vec<ArchiveEntry>> {
-        let archive = sevenz_rust2::Archive::open(&self.path).map_err(sevenz_error)?;
-        Ok(archive
+        Ok(self
+            .archive
             .files
             .iter()
             .map(|entry| {
@@ -1011,59 +1358,26 @@ impl ArchiveVfs for SevenZArchiveVfs {
     }
 
     fn open(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
-        if let Some(reader) = self.cache.get(path)? {
-            return Ok(reader);
-        }
-
-        let target_name = {
-            let archive = sevenz_rust2::Archive::open(&self.path).map_err(sevenz_error)?;
-            let entry = archive
-                .files
-                .iter()
-                .find(|entry| Path::new(entry.name()) == path)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("archive entry was not found: {}", path.display()),
-                    )
-                })?;
-            if entry.is_directory() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("archive entry is a directory: {}", path.display()),
-                ));
-            }
-            entry.name().to_owned()
-        };
-
-        let mut reader =
-            sevenz_rust2::ArchiveReader::open(&self.path, sevenz_rust2::Password::empty())
-                .map_err(sevenz_error)?;
-        let mut materializer = Materializer::new(self.cache.memory_threshold);
-        let mut found = false;
-        reader
-            .for_each_entries(
-                &mut |entry: &sevenz_rust2::ArchiveEntry, source: &mut dyn Read| {
-                    if entry.name() == target_name {
-                        io::copy(source, &mut materializer)?;
-                        found = true;
-                        Ok(false)
-                    } else {
-                        io::copy(source, &mut io::sink())?;
-                        Ok(true)
-                    }
-                },
-            )
-            .map_err(sevenz_error)?;
-
-        if !found {
-            return Err(io::Error::new(
+        let location = self.entries.get(path).ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("archive entry was not found: {}", path.display()),
+            )
+        })?;
+        if location.is_directory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("archive entry is a directory: {}", path.display()),
             ));
         }
-        self.cache
-            .insert_entry(path.to_owned(), materializer.finish()?)
+
+        let Some(block_index) = location.block_index else {
+            return Ok(Box::new(io::Cursor::new(Vec::new())));
+        };
+        let block = self
+            .cache
+            .get_or_load(block_index, || self.materialize_block(block_index))?;
+        block.reader(path)
     }
 }
 
@@ -1171,10 +1485,148 @@ fn rars_error(error: rars::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{CachedEntry, DEFAULT_MAX_CACHE_BYTES, DEFAULT_MEMORY_THRESHOLD, EntryCache};
-    use std::io::{Cursor, Read};
+    use super::{
+        BlockCache, BlockStorage, CachedEntry, DEFAULT_MAX_CACHE_BYTES, DEFAULT_MEMORY_THRESHOLD,
+        DecodedBlock, EntryCache,
+    };
+    use std::collections::HashMap;
+    use std::io::{Cursor, Read, Seek, SeekFrom, Write};
     use std::num::NonZeroUsize;
-    use std::path::Path;
+    use std::ops::Range;
+    use std::path::{Path, PathBuf};
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn memory_block(path: &str, contents: &[u8]) -> DecodedBlock {
+        let mut ranges = HashMap::<PathBuf, Range<usize>>::new();
+        ranges.insert(PathBuf::from(path), 0..contents.len());
+        DecodedBlock {
+            storage: BlockStorage::Memory(contents.to_vec()),
+            ranges,
+        }
+    }
+
+    #[test]
+    fn block_range_reader_supports_start_current_and_end_seek() {
+        let mut block = memory_block("entry", b"__abcde");
+        block.ranges.insert(PathBuf::from("entry"), 2..7);
+        let block = Arc::new(block);
+        let mut reader = block
+            .reader(Path::new("entry"))
+            .expect("create block range reader");
+
+        assert_eq!(reader.seek(SeekFrom::Start(1)).expect("seek from start"), 1);
+        let mut pair = [0; 2];
+        reader.read_exact(&mut pair).expect("read after start seek");
+        assert_eq!(&pair, b"bc");
+
+        assert_eq!(
+            reader
+                .seek(SeekFrom::Current(-1))
+                .expect("seek from current"),
+            2
+        );
+        let mut byte = [0];
+        reader
+            .read_exact(&mut byte)
+            .expect("read after current seek");
+        assert_eq!(&byte, b"c");
+
+        assert_eq!(reader.seek(SeekFrom::End(-2)).expect("seek from end"), 3);
+        let mut suffix = [0; 2];
+        reader.read_exact(&mut suffix).expect("read after end seek");
+        assert_eq!(&suffix, b"de");
+    }
+
+    #[test]
+    fn block_cache_evicts_by_decoded_bytes() {
+        let cache = BlockCache::new(NonZeroUsize::new(4).expect("non-zero capacity"), 4);
+        cache
+            .get_or_load(0, || Ok(memory_block("first", b"abc")))
+            .expect("cache first block");
+        cache
+            .get_or_load(1, || Ok(memory_block("second", b"def")))
+            .expect("cache second block");
+        assert_eq!(
+            cache.cached_entry_count().expect("count cached entries"),
+            1,
+            "the byte budget must evict the least-recently-used block"
+        );
+
+        let mut loads = 0;
+        cache
+            .get_or_load(0, || {
+                loads += 1;
+                Ok(memory_block("first", b"abc"))
+            })
+            .expect("reload evicted block");
+        assert_eq!(loads, 1, "an evicted block must be decoded again");
+    }
+
+    #[test]
+    fn concurrent_block_cache_misses_only_load_once() {
+        let cache = Arc::new(BlockCache::new(
+            NonZeroUsize::new(4).expect("non-zero capacity"),
+            16,
+        ));
+        let barrier = Arc::new(Barrier::new(3));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                let loads = Arc::clone(&loads);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .get_or_load(0, || {
+                            loads.fetch_add(1, Ordering::SeqCst);
+                            Ok(memory_block("entry", b"block data"))
+                        })
+                        .expect("load shared block")
+                })
+            })
+            .collect();
+        barrier.wait();
+
+        for worker in workers {
+            worker.join().expect("join block cache worker");
+        }
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "concurrent misses must share one block materialization"
+        );
+    }
+
+    #[test]
+    fn temporary_block_storage_lives_until_the_last_reader_drops() {
+        let mut file = tempfile::NamedTempFile::new().expect("create block tempfile");
+        file.write_all(b"__abcde").expect("write block tempfile");
+        let path = file.path().to_owned();
+        let storage = BlockStorage::from_entry(CachedEntry::Temporary(file))
+            .expect("map temporary block storage");
+        let block = Arc::new(DecodedBlock {
+            storage,
+            ranges: HashMap::from([(PathBuf::from("entry"), 2..7)]),
+        });
+        let reader = block
+            .reader(Path::new("entry"))
+            .expect("create temporary-backed reader");
+
+        drop(block);
+        assert!(
+            path.exists(),
+            "open readers must retain their block backing"
+        );
+        drop(reader);
+        assert!(
+            !path.exists(),
+            "temporary block storage must be removed after its final reader drops"
+        );
+    }
 
     #[test]
     fn cache_evicts_least_recently_used_entry() {
