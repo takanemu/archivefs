@@ -59,9 +59,15 @@ fn reuses_cached_rar_entry() {
     let path = std::path::Path::new("readme.txt");
 
     vfs.open(path).expect("open RAR entry first time");
-    assert_eq!(vfs.cache_len().expect("read cache length"), 1);
+    assert_eq!(
+        vfs.cache_len().expect("read cache length"),
+        2,
+        "one RAR solid extraction must cache all regular entries"
+    );
     vfs.open(path).expect("open RAR entry second time");
-    assert_eq!(vfs.cache_len().expect("read cache length"), 1);
+    vfs.open(std::path::Path::new("first.txt"))
+        .expect("open another RAR entry from the materialized solid stream");
+    assert_eq!(vfs.cache_len().expect("read cache length"), 2);
 }
 
 #[test]

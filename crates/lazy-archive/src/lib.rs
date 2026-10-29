@@ -1385,6 +1385,7 @@ impl ArchiveVfs for SevenZArchiveVfs {
 pub struct RarArchiveVfs {
     path: PathBuf,
     cache: EntryCache,
+    materialization_lock: Mutex<()>,
 }
 
 impl RarArchiveVfs {
@@ -1395,7 +1396,11 @@ impl RarArchiveVfs {
     pub fn with_cache(path: impl Into<PathBuf>, cache: EntryCache) -> Result<Self> {
         let path = path.into();
         rars::ArchiveReader::read_path(&path).map_err(rars_error)?;
-        Ok(Self { path, cache })
+        Ok(Self {
+            path,
+            cache,
+            materialization_lock: Mutex::new(()),
+        })
     }
 
     pub fn cache_len(&self) -> io::Result<usize> {
@@ -1424,6 +1429,14 @@ impl ArchiveVfs for RarArchiveVfs {
             return Ok(reader);
         }
 
+        let _materialization_guard = self
+            .materialization_lock
+            .lock()
+            .map_err(|_| io::Error::other("RAR materialization was poisoned"))?;
+        if let Some(reader) = self.cache.get(path)? {
+            return Ok(reader);
+        }
+
         let name = path.to_string_lossy().into_owned().into_bytes();
         let archive = rars::ArchiveReader::read_path(&self.path).map_err(rars_error)?;
         let member = archive
@@ -1442,14 +1455,22 @@ impl ArchiveVfs for RarArchiveVfs {
             ));
         }
 
-        let materializer =
-            std::sync::Arc::new(Mutex::new(Materializer::new(self.cache.memory_threshold)));
-        let target = std::sync::Arc::clone(&materializer);
+        let materializers: HashMap<_, _> = archive
+            .members()
+            .filter(|member| !member.meta.is_directory)
+            .map(|member| {
+                (
+                    member.meta.name.clone(),
+                    std::sync::Arc::new(Mutex::new(Materializer::new(self.cache.memory_threshold))),
+                )
+            })
+            .collect();
+        let targets = materializers.clone();
         archive
             .extract_to(None, |meta| {
-                if meta.name_bytes() == name.as_slice() && !meta.is_directory {
+                if let Some(materializer) = targets.get(meta.name_bytes()) {
                     Ok(Box::new(SharedMaterializerWriter {
-                        materializer: std::sync::Arc::clone(&target),
+                        materializer: std::sync::Arc::clone(materializer),
                     }) as Box<dyn Write>)
                 } else {
                     Ok(Box::new(io::sink()) as Box<dyn Write>)
@@ -1457,13 +1478,28 @@ impl ArchiveVfs for RarArchiveVfs {
             })
             .map_err(rars_error)?;
 
-        drop(target);
-        let materializer = std::sync::Arc::try_unwrap(materializer)
-            .map_err(|_| io::Error::other("RAR materializer is still in use"))?
-            .into_inner()
-            .map_err(|_| io::Error::other("RAR materializer was poisoned"))?;
-        self.cache
-            .insert_entry(path.to_owned(), materializer.finish()?)
+        drop(targets);
+        let mut target_reader = None;
+        for (entry_name, materializer) in materializers {
+            let materializer = std::sync::Arc::try_unwrap(materializer)
+                .map_err(|_| io::Error::other("RAR materializer is still in use"))?
+                .into_inner()
+                .map_err(|_| io::Error::other("RAR materializer was poisoned"))?;
+            let entry_path = PathBuf::from(String::from_utf8_lossy(&entry_name).into_owned());
+            let reader = self
+                .cache
+                .insert_entry(entry_path.clone(), materializer.finish()?)?;
+            if entry_path == path {
+                target_reader = Some(reader);
+            }
+        }
+
+        target_reader.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("archive entry was not materialized: {}", path.display()),
+            )
+        })
     }
 }
 
