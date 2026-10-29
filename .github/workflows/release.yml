@@ -83,8 +83,11 @@ jobs:
         run: |
           set -euo pipefail
           package_dir="archivefs-${RELEASE_TAG}-x86_64-unknown-linux-gnu"
+          binary_name="archivefs-bench-${RELEASE_TAG}-x86_64-unknown-linux-gnu"
           mkdir -p "${package_dir}"
           install -m 0755 target/release/archivefs-bench "${package_dir}/archivefs-bench"
+          install -m 0755 target/release/archivefs-bench "${binary_name}"
+          sha256sum "${binary_name}" > "${binary_name}.sha256"
           cp README.md "${package_dir}/"
           cp doc/api-guide.md "${package_dir}/"
           tar -czf "${package_dir}.tar.gz" "${package_dir}"
@@ -97,6 +100,7 @@ jobs:
           path: |
             archivefs-*.tar.gz
             archivefs-*.tar.gz.sha256
+            archivefs-bench-*
           if-no-files-found: error
 
   publish:
@@ -115,7 +119,10 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release create "${RELEASE_TAG}" archivefs-*.tar.gz archivefs-*.tar.gz.sha256 \
+          gh release create "${RELEASE_TAG}" \
+            archivefs-*.tar.gz \
+            archivefs-*.tar.gz.sha256 \
+            archivefs-bench-* \
             --repo "${GITHUB_REPOSITORY}" \
             --generate-notes \
             --verify-tag
