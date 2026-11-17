@@ -2,6 +2,7 @@
 name = "lazy-archive"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Lazy archive-backed implementations of the archivefs VFS interfaces"

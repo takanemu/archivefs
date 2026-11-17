@@ -66,6 +66,8 @@ cargo run -p archivefs-bench -- verify archive.rar
 
 ## 開発
 
+開発にはRust 1.100.0を使用します（`rust-toolchain.toml`で固定）。
+
 ```sh
 cargo test --workspace
 cargo fmt --all -- --check
